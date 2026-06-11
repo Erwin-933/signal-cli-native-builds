@@ -1,0 +1,151 @@
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version'
+        required: true
+        default: 'v0.14.5'
+
+permissions:
+  contents: write
+
+env:
+    GRAALVM_VERSION: 25.0.2
+
+jobs:
+  build:
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      matrix:
+        config: [
+          {os: ubuntu-24.04-arm, arch: "arm64"},
+          {os: ubuntu-24.04, arch: "x86-64"}
+        ]
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v6
+      - name: Setup GraalVM
+        run: |
+          arch=$([ "${{ matrix.config.arch }}" == "x86-64" ] && echo "x64" || echo "aarch64")
+          echo "Download GraalVM for architecture ${arch}"
+          wget -nv https://github.com/graalvm/graalvm-ce-builds/releases/download/jdk-${GRAALVM_VERSION}/graalvm-community-jdk-${GRAALVM_VERSION}_linux-${arch}_bin.tar.gz -O $GITHUB_WORKSPACE/gvm.tar.gz
+          mkdir $GITHUB_WORKSPACE/graalvm
+          tar xvf gvm.tar.gz -C $GITHUB_WORKSPACE/graalvm --strip-components=1
+          echo "GRAALVM_HOME=$GITHUB_WORKSPACE/graalvm" >> $GITHUB_ENV
+          echo "PATH=$GITHUB_WORKSPACE/graalvm/bin:$PATH" >> $GITHUB_ENV
+          echo "JAVA_HOME=$GITHUB_WORKSPACE/graalvm" >> $GITHUB_ENV
+          echo $GRAALVM_HOME
+          echo $PATH
+          echo $JAVA_HOME
+          ls -la $GITHUB_WORKSPACE/graalvm
+      - name: Clone signal-cli repository
+        run: git clone --depth 1 --branch ${{ inputs.version }} https://github.com/AsamK/signal-cli/ signal-cli
+      - name: Free up disk space
+        run: |
+          # Remove Java (JDKs)
+          sudo rm -rf /usr/lib/jvm
+
+          # Remove .NET SDKs
+          sudo rm -rf /usr/share/dotnet
+
+          # Remove Swift toolchain
+          sudo rm -rf /usr/share/swift
+
+          # Remove Haskell (GHC)
+          sudo rm -rf /usr/local/.ghcup
+
+          # Remove Julia
+          sudo rm -rf /usr/local/julia*
+
+          # Remove Android SDKs
+          sudo rm -rf /usr/local/lib/android
+
+          # Remove Chromium
+          sudo rm -rf /usr/local/share/chromium
+
+          # Remove Microsoft/Edge and Google Chrome builds
+          sudo rm -rf /opt/microsoft /opt/google
+
+          # Remove Azure CLI
+          sudo rm -rf /opt/az
+
+          # Remove PowerShell
+          sudo rm -rf /usr/local/share/powershell
+
+          # Remove CodeQL and other toolcaches
+          #sudo rm -rf /opt/hostedtoolcache
+
+          #docker system prune -af || true
+          #docker builder prune -af || true
+          df -h
+      - name: Determine libsignal version
+        run: |
+          cd $GITHUB_WORKSPACE/signal-cli
+          ver=$(< libsignal-version)
+          echo "LIBSIGNAL_VERSION=$ver" >> $GITHUB_ENV
+          echo "signal-cli requires libsignal-client version ${LIBSIGNAL_VERSION}"
+      - name: Get libsignal-client version
+        run: |
+          cd ${GITHUB_WORKSPACE}
+          wget https://github.com/bbernhard/libsignal-client-builds/releases/download/v${LIBSIGNAL_VERSION}/libsignal-client-build-v${LIBSIGNAL_VERSION}.tar.gz
+          tar xvf libsignal-client-build-v${LIBSIGNAL_VERSION}.tar.gz
+          cp ${GITHUB_WORKSPACE}/${{ matrix.config.arch }}/libsignal_jni.so /tmp/libsignal_jni.so
+      - name: Get signal-cli release to extract jar file
+        run: |
+          mkdir /tmp/signal-cli-release
+          tagWithoutPrefix=${{ inputs.version}}
+          tagWithoutPrefix=${tagWithoutPrefix#v}
+          wget -nv https://github.com/AsamK/signal-cli/releases/download/${{ inputs.version}}/signal-cli-${tagWithoutPrefix}.tar.gz -O /tmp/signal-cli-release/signal-cli.tar.gz
+          cd /tmp/signal-cli-release
+          tar xvf signal-cli.tar.gz
+          cp /tmp/signal-cli-release/signal-cli-${tagWithoutPrefix}/lib/libsignal-client-${LIBSIGNAL_VERSION}.jar /tmp/libsignal-client.jar
+      - name: Update libsignal-client.jar with libsignal_jni.so
+        run: |
+          cd /tmp && zip -qu libsignal-client.jar libsignal_jni.so
+      - name: Build native version
+        run: |
+          df -h
+          echo "Apply signal-cli-native-patch"
+          cd $GITHUB_WORKSPACE/signal-cli && git apply ${GITHUB_WORKSPACE}/signal-cli-native.patch
+          echo "Start native build (libsignal-version: ${LIBSIGNAL_VERSION})"
+          cd $GITHUB_WORKSPACE/signal-cli && ./gradlew nativeCompile
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-image-${{ matrix.config.arch }}
+          path: signal-cli/build/native/nativeCompile/signal-cli
+          if-no-files-found: error
+          retention-days: 1
+  release:
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v6
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+      - name: Create archive
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/assets/signal-cli-native-${{ inputs.version }}/x86-64
+          mkdir -p $GITHUB_WORKSPACE/assets/signal-cli-native-${{ inputs.version }}/arm64
+          cp native-image-x86-64/signal-cli $GITHUB_WORKSPACE/assets/signal-cli-native-${{ inputs.version }}/x86-64/signal-cli-native
+          cp native-image-arm64/signal-cli $GITHUB_WORKSPACE/assets/signal-cli-native-${{ inputs.version }}/arm64/signal-cli-native
+          cd $GITHUB_WORKSPACE/assets
+          tar -czvf signal-cli-native-${{ inputs.version }}.tar.gz signal-cli-native-${{ inputs.version }}
+      - name: Create a new release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd $GITHUB_WORKSPACE/
+          gh release create \
+            --target master \
+            --title "Version ${{ inputs.version }}" \
+            --notes "Produced by GitHub actions run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            ${{ inputs.version }}
+      - name: Upload release asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload ${{ inputs.version }} "${GITHUB_WORKSPACE}/assets/signal-cli-native-${{ inputs.version }}.tar.gz"
+
