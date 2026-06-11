@@ -6,6 +6,10 @@ on:
       version:
         description: 'Version'
         required: true
+        default: 'v0.14.5'
+
+permissions:
+  contents: write
 
 env:
     GRAALVM_VERSION: 25.0.2
